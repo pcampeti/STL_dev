@@ -834,6 +834,8 @@ class WavelateOperator2Dkernel_torch:
         orient_real = torch.tensor(doorientw(wwc), device=self.device, dtype=self.dtype)
         orient_imag = torch.tensor(doorientw(wws), device=self.device, dtype=self.dtype)
 
+        oriented_kernel = torch.complex(orient_real, orient_imag)
+
         # Complex kernel packed for convenience
         kernel = torch.complex(real_kernel, imag_kernel)
 
@@ -841,6 +843,8 @@ class WavelateOperator2Dkernel_torch:
         self.ww_RealT = [None, real_kernel, orient_real]
         self.ww_ImagT = [None, imag_kernel, orient_imag]
         self.ww_SmoothT = [None, smooth_kernel]
+
+        self.oriented_kernel = oriented_kernel
 
         return kernel, real_kernel, imag_kernel, smooth_kernel
 
@@ -1065,7 +1069,10 @@ class WavelateOperator2Dkernel_torch:
         elif x.dim() == 3:
             x = x.unsqueeze(1)
 
-        weight = self.kernel  # [L, 1, K, K]
+        if x.shape[-3] == 1:
+            weight = self.kernel  # [L, 1, K, K]
+        else:
+            weight = self.oriented_kernel  # [L^2, L, K, K] to handle orientation stacks
 
         convolved = _complex_conv2d_same_symmetric(x, weight)
 
