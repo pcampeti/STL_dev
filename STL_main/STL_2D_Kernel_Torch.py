@@ -38,13 +38,20 @@ def _conv2d_same_symmetric(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """
 
     *leading_dims, C, Nx, Ny = x.shape
-    O_c, _, wx, wy = w.shape
+    O_c, Cw, wx, wy = w.shape
 
     B = int(torch.prod(torch.tensor(leading_dims))) if leading_dims else 1
     x4d = x.reshape(B, C, Nx, Ny)
 
     pad_x = wx // 2
     pad_y = wy // 2
+
+    # If the kernel expects a single channel but the input has multiple
+    # channels (e.g. orientation stacks), broadcast the kernel across the
+    # channel dimension to mirror FoCUS behavior of applying the same filter
+    # to each input channel before summing.
+    if Cw == 1 and C > 1:
+        w = w.repeat(1, C, 1, 1)
 
     x_padded = F.pad(x4d, (pad_y, pad_y, pad_x, pad_x), mode="reflect")
     y = F.conv2d(x_padded, w)
@@ -70,13 +77,16 @@ def _conv2d_circular(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """
 
     *leading_dims, C, Nx, Ny = x.shape
-    O_c, _, wx, wy = w.shape
+    O_c, Cw, wx, wy = w.shape
 
     B = int(torch.prod(torch.tensor(leading_dims))) if leading_dims else 1
     x4d = x.reshape(B, C, Nx, Ny)
 
     pad_x = wx // 2
     pad_y = wy // 2
+
+    if Cw == 1 and C > 1:
+        w = w.repeat(1, C, 1, 1)
 
     x_padded = F.pad(x4d, (pad_y, pad_y, pad_x, pad_x), mode="circular")
     y = F.conv2d(x_padded, w)
