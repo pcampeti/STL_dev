@@ -713,51 +713,103 @@ class WavelateOperator2Dkernel_torch:
         self.device = torch.device(device)
         self.dtype = dtype
 
-        self.kernel = self._wavelet_kernel(kernel_size,L)
+        self.kernel, real_kernel, imag_kernel, smooth_kernel = self._wavelet_kernel(
+            kernel_size, L
+        )
         self.WType='simple'
         # Precompute real/imag kernels for symmetric padding convolutions
-        self.ww_RealT = [None, torch.real(self.kernel.squeeze(0))]
-        self.ww_ImagT = [None, torch.imag(self.kernel.squeeze(0))]
-        # Low-pass kernel derived from the first orientation
-        base_smooth = torch.abs(self.kernel.squeeze(0)[0:1])
-        self.ww_SmoothT = [None, base_smooth / base_smooth.sum()]
+        self.ww_RealT = [None, real_kernel]
+        self.ww_ImagT = [None, imag_kernel]
+        # Low-pass kernel derived from the explicit FoCUS window
+        self.ww_SmoothT = [None, smooth_kernel]
         
-    def _wavelet_kernel(self,kernel_size: int,n_orientation: int,sigma=1):
-        """Create a 2D Wavelet kernel."""
-        # coords = torch.arange(kernel_size, device=self.device, dtype=self.dtype) - (kernel_size - 1) / 2.0
-        # yy, xx = torch.meshgrid(coords, coords, indexing="ij")
-        # mother_kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))[None,:,:]
-        # angles=torch.arange(n_orientation, device=self.device, dtype=self.dtype)/n_orientation*torch.pi
-        # angles_proj=torch.pi*(xx[None,...]*torch.cos(angles[:,None,None])+yy[None,...]*torch.sin(angles[:,None,None]))
-        # kernel = torch.complex(torch.cos(angles_proj)*mother_kernel,torch.sin(angles_proj)*mother_kernel)
-        # kernel = kernel - torch.mean(kernel,dim=(1,2))[:,None,None]
-        # kernel = kernel / torch.sqrt(torch.sum(kernel**2, dim=(1,2)))[:,None,None]
-        # return kernel.reshape(1,n_orientation,kernel_size,kernel_size)
-        
-        ###Morlay wavelet
-        coords = torch.arange(kernel_size, device=self.device, dtype=self.dtype) - (kernel_size - 1) / 2.0
-        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
-        
-        # Gaussian envelope
-        gaussian_envelope = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
-        
-        # Orientations
-        angles = torch.arange(n_orientation, device=self.device, dtype=self.dtype) / n_orientation * torch.pi
-        
-        # Morlet wavelet: exp(i*k0*x_rot) * gaussian_envelope
-        # x_rot is the coordinate along the orientation direction
-        x_rot = xx[None, :, :] * torch.cos(angles[:, None, None]) + yy[None, :, :] * torch.sin(angles[:, None, None])
-        
-        # Complex Morlet wavelet
-        kernel = torch.exp(1j * 0.75 * np.pi * x_rot ) * gaussian_envelope[None, :, :]
-        
-        # Remove DC component (admissibility condition)
-        kernel = kernel - torch.mean(kernel, dim=(1, 2))[:, None, None]
-        
-        # L2 normalization
-        kernel = kernel / torch.sqrt(torch.sum(torch.abs(kernel)**2, dim=(1, 2)))[:, None, None]
-        
-        return kernel.reshape(1, n_orientation, kernel_size, kernel_size)
+    def _wavelet_kernel(self, kernel_size: int, n_orientation: int):
+        """FoCUS CNNV1 planar wavelet construction (cos/sin over Gaussian)."""
+
+        KERNELSZ = kernel_size
+        NORIENT = n_orientation
+        LAMBDA = 1.0
+
+        # Allocate real/imag components
+        wwc = np.zeros([NORIENT, KERNELSZ * KERNELSZ], dtype=np.float64)
+        wws = np.zeros_like(wwc)
+
+        x = np.repeat(np.arange(KERNELSZ) - KERNELSZ // 2, KERNELSZ).reshape(
+            KERNELSZ, KERNELSZ
+        )
+        y = x.T
+
+        if NORIENT == 1:
+            xx = (3.0 / float(KERNELSZ)) * LAMBDA * x
+            yy = (3.0 / float(KERNELSZ)) * LAMBDA * y
+
+            if KERNELSZ == 5:
+                w_smooth = np.exp(-(xx**2 + yy**2))
+                tmp = np.exp(-2 * (xx**2 + yy**2)) - 0.25 * np.exp(
+                    -0.5 * (xx**2 + yy**2)
+                )
+            else:
+                w_smooth = np.exp(-0.5 * (xx**2 + yy**2))
+                tmp = np.exp(-2 * (xx**2 + yy**2)) - 0.25 * np.exp(
+                    -0.5 * (xx**2 + yy**2)
+                )
+
+            wwc[0] = tmp.flatten() - tmp.mean()
+            wws[0] = np.zeros_like(wwc[0])
+            sigma = np.sqrt((wwc[:, 0] ** 2).mean())
+            wwc[0] /= sigma
+            wws[0] /= sigma
+
+            w_smooth = w_smooth.flatten()
+        else:
+            for i in range(NORIENT):
+                a = (NORIENT - 1 - i) / float(NORIENT) * np.pi
+                if KERNELSZ < 5:
+                    xx = (3.0 / float(KERNELSZ)) * LAMBDA * (
+                        x * np.cos(a) + y * np.sin(a)
+                    )
+                    yy = (3.0 / float(KERNELSZ)) * LAMBDA * (
+                        x * np.sin(a) - y * np.cos(a)
+                    )
+                else:
+                    xx = (3.0 / 5.0) * LAMBDA * (x * np.cos(a) + y * np.sin(a))
+                    yy = (3.0 / 5.0) * LAMBDA * (x * np.sin(a) - y * np.cos(a))
+
+                if KERNELSZ == 5:
+                    w_smooth = np.exp(-2 * ((3.0 / float(KERNELSZ) * xx) ** 2 + (3.0 / float(KERNELSZ) * yy) ** 2))
+                else:
+                    w_smooth = np.exp(-0.5 * (xx**2 + yy**2))
+
+                tmp1 = np.cos(yy * np.pi) * w_smooth
+                tmp2 = np.sin(yy * np.pi) * w_smooth
+
+                wwc[i] = tmp1.flatten() - tmp1.mean()
+                wws[i] = tmp2.flatten() - tmp2.mean()
+                sigma = np.mean(w_smooth)
+                wwc[i] /= sigma
+                wws[i] /= sigma
+
+                w_smooth = w_smooth.flatten()
+
+        w_smooth = w_smooth / w_smooth.sum()
+
+        # Real/imaginary kernels for the primary convolution path
+        real_kernel = torch.tensor(
+            wwc.reshape(NORIENT, KERNELSZ, KERNELSZ), device=self.device, dtype=self.dtype
+        )
+        imag_kernel = torch.tensor(
+            wws.reshape(NORIENT, KERNELSZ, KERNELSZ), device=self.device, dtype=self.dtype
+        )
+
+        # Low-pass smoothing window
+        smooth_kernel = torch.tensor(
+            w_smooth.reshape(1, KERNELSZ, KERNELSZ), device=self.device, dtype=self.dtype
+        )
+
+        # Complex kernel packed for convenience
+        kernel = torch.complex(real_kernel, imag_kernel).unsqueeze(0)
+
+        return kernel, real_kernel, imag_kernel, smooth_kernel
 
     def _bk_resize_image(self, im: torch.Tensor, noutx: int, nouty: int) -> torch.Tensor:
         """Torch bilinear resize mirroring FoCUS.backend.bk_resize_image."""
