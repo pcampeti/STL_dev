@@ -46,15 +46,21 @@ def _conv2d_same_symmetric(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     pad_x = wx // 2
     pad_y = wy // 2
 
-    # If the kernel expects a single channel but the input has multiple
-    # channels (e.g. orientation stacks), broadcast the kernel across the
-    # channel dimension to mirror FoCUS behavior of applying the same filter
-    # to each input channel before summing.
-    if Cw == 1 and C > 1:
-        w = w.repeat(1, C, 1, 1)
+    # Determine grouping strategy: if the input channel count matches the
+    # number of output channels and the kernel is single-channel, use
+    # depthwise convolution to keep channels independent (orientation-wise
+    # filtering). Otherwise fall back to standard grouped convolution with a
+    # broadcasted kernel when needed.
+    if Cw == 1 and O_c == C:
+        groups = C
+        w = w.expand(C, 1, wx, wy).contiguous()
+    else:
+        groups = 1
+        if Cw == 1 and C > 1:
+            w = w.repeat(1, C, 1, 1)
 
     x_padded = F.pad(x4d, (pad_y, pad_y, pad_x, pad_x), mode="reflect")
-    y = F.conv2d(x_padded, w)
+    y = F.conv2d(x_padded, w, groups=groups)
 
     return y.reshape(*leading_dims, O_c, Nx, Ny)
 
@@ -85,11 +91,16 @@ def _conv2d_circular(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     pad_x = wx // 2
     pad_y = wy // 2
 
-    if Cw == 1 and C > 1:
-        w = w.repeat(1, C, 1, 1)
+    if Cw == 1 and O_c == C:
+        groups = C
+        w = w.expand(C, 1, wx, wy).contiguous()
+    else:
+        groups = 1
+        if Cw == 1 and C > 1:
+            w = w.repeat(1, C, 1, 1)
 
     x_padded = F.pad(x4d, (pad_y, pad_y, pad_x, pad_x), mode="circular")
-    y = F.conv2d(x_padded, w)
+    y = F.conv2d(x_padded, w, groups=groups)
 
     return y.reshape(*leading_dims, O_c, Nx, Ny)
 
@@ -1069,10 +1080,10 @@ class WavelateOperator2Dkernel_torch:
         elif x.dim() == 3:
             x = x.unsqueeze(1)
 
-        if x.shape[-3] == 1:
-            weight = self.kernel  # [L, 1, K, K]
-        else:
-            weight = self.oriented_kernel  # [L^2, L, K, K] to handle orientation stacks
+        # For the operator pathway, always use the base kernel; depthwise
+        # grouping inside the convolution keeps per-orientation channels
+        # independent when more than one channel is present.
+        weight = self.kernel  # [L, 1, K, K]
 
         convolved = _complex_conv2d_same_symmetric(x, weight)
 
