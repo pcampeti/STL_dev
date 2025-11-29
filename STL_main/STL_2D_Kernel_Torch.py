@@ -702,6 +702,17 @@ class STL_2D_Kernel_Torch:
 
         x_o = _ensure_orient(x)
         y_o = _ensure_orient(y)
+
+        # Ensure there are at least two leading dims (batch, channel)
+        # ahead of the orientation axis so downstream code can rely on
+        # a consistent [Nb, Nc, L, Nx, Ny] layout even when the inputs
+        # were provided without explicit batch/channel axes.
+        while x_o.dim() < 5:
+            x_o = x_o.unsqueeze(0)
+            y_o = y_o.unsqueeze(0)
+            if mask_MR is not None:
+                mask_MR = [m.unsqueeze(0) for m in mask_MR] if isinstance(mask_MR, list) else mask_MR.unsqueeze(0)
+
         orient_dim = x_o.dim() - 3  # index of the orientation axis
 
         spatial_dims = (-2, -1)
