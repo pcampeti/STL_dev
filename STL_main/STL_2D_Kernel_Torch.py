@@ -665,8 +665,13 @@ class STL_2D_Kernel_Torch:
     ###########################################################################
     def cov(self, data2=None, mask_MR=None, remove_mean=False):
         """
-        Compute the covariance between data1=self and data2 on the last two
-        dimensions (Nx, Ny).
+        Covariance on the spatial dimensions while preserving orientation axes.
+
+        The input arrays are expected to have spatial dimensions as the last
+        two axes. If an orientation/channel axis exists, it is assumed to be at
+        ``-3``; if not present, a singleton axis is inserted so that the output
+        keeps explicit orientation indices. This mirrors the FoCUS behavior
+        where covariances are computed per-orientation pair.
 
         Only works when MR == False.
         """
@@ -685,31 +690,47 @@ class STL_2D_Kernel_Torch:
                 raise ValueError("data2 must have the same dg as self.")
             y = data2.array
 
-        dims = (-2, -1)
+        # Ensure an explicit orientation axis just before the spatial axes
+        def _ensure_orient(t: torch.Tensor) -> torch.Tensor:
+            if t.dim() < 2:
+                raise ValueError("Inputs to cov must have at least 2 spatial dims.")
+            if t.dim() == 2:  # [Nx, Ny]
+                return t.unsqueeze(0)
+            if t.dim() == 3:  # [..., Nx, Ny] with no orientation
+                return t.unsqueeze(-3)
+            return t
+
+        x_o = _ensure_orient(x)
+        y_o = _ensure_orient(y)
+
+        spatial_dims = (-2, -1)
 
         if mask_MR is not None:
             mask = self._get_mask_at_dg(mask_MR, self.dg)
+            mask = _ensure_orient(mask)
             if remove_mean:
-                mx = (x * mask).mean(dim=dims, keepdim=True)
-                my = (y * mask).mean(dim=dims, keepdim=True)
-                x_c = x - mx
-                y_c = y - my
+                mx = (x_o * mask).mean(dim=spatial_dims, keepdim=True)
+                my = (y_o * mask).mean(dim=spatial_dims, keepdim=True)
+                x_c = x_o - mx
+                y_c = y_o - my
             else:
-                x_c = x
-                y_c = y
-            cov = (x_c * y_c.conj() * mask).mean(dim=dims)
+                x_c = x_o
+                y_c = y_o
+            prod = x_c.unsqueeze(-3) * y_c.conj().unsqueeze(-4) * mask.unsqueeze(-3)
         else:
             if remove_mean:
-                mx = x.mean(dim=dims, keepdim=True)
-                my = y.mean(dim=dims, keepdim=True)
-                x_c = x - mx
-                y_c = y - my
+                mx = x_o.mean(dim=spatial_dims, keepdim=True)
+                my = y_o.mean(dim=spatial_dims, keepdim=True)
+                x_c = x_o - mx
+                y_c = y_o - my
             else:
-                x_c = x
-                y_c = y
-            cov = (x_c * y_c.conj()).mean(dim=dims)
-            
-        return cov        
+                x_c = x_o
+                y_c = y_o
+            prod = x_c.unsqueeze(-3) * y_c.conj().unsqueeze(-4)
+
+        cov = prod.mean(dim=spatial_dims)
+
+        return cov
        
     def get_wavelet_op(self, J=None, L=None, kernel_size=None):
         if L is None:

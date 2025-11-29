@@ -376,18 +376,18 @@ class ST_Operator:
             data_l1m_l2m={}
             for j2 in range(j3+1): 
                 data_l1m_l2 = self.wavelet_op.apply(data_l1m[j2],j=j3) # (Nb,Nc,L2,L3,N3)
-                # S3(j2,j3) = Cov(|I*psi2|*psi3, I*psi3) 
-                data_st.S3[:,:,j2,j3,:,:] = data_l1m_l2[:,:,None].cov(          #(Nb,Nc, 1,L3,N3)
-                                 data_l1                                        #(Nb,Nc, 1,L3,N3)
-                                 )        
+                # S3(j2,j3) = Cov(|I*psi2|*psi3, I*psi3)
+                s3_cov = data_l1m_l2.cov(data_l1)          #(Nb,Nc,L2,L3)
+                data_st.S3[:,:,j2,j3,:,:] = s3_cov
                                  
                 data_l1m_l2m[j2] = data_l1m_l2.modulus(inplace=False)                #(Nb,Nc,L,N3)
                 
                 for j1 in range(j2+1):
                     # S4(j1,j2,j3) = Cov(|I*psi1|*psi3, |I*psi2|*psi3)
-                    data_st.S4[:,:,j1,j2,j3,:,:,:] = data_l1m_l2m[j1][:,:,None,:].cov(
-                            data_l1m_l2m[j2][:,:,:,None]
-                            )         
+                    s4_cov = data_l1m_l2m[j1].cov(data_l1m_l2m[j2])  #(Nb,Nc,L1,L2)
+                    data_st.S4[:,:,j1,j2,j3,:,:,:] = s4_cov.unsqueeze(-3).expand(
+                            -1, -1, self.wavelet_op.L, -1, -1
+                        )
 
             if data_st.DT != '2D_FFT_Torch':
                 # Downsample at Nj3
