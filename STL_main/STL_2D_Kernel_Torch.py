@@ -723,8 +723,20 @@ class WavelateOperator2Dkernel_torch:
         NORIENT = n_orientation
         LAMBDA = 1.0
 
-        # Allocate real/imag components
-        wwc = np.zeros([NORIENT, KERNELSZ * KERNELSZ], dtype=np.float64)
+        # Allocate real/imag components using a numpy dtype compatible with the torch dtype
+        if self.dtype in (torch.float64, torch.complex128):
+            np_dtype = np.float64
+        elif self.dtype in (torch.float32, torch.complex64):
+            np_dtype = np.float32
+        elif self.dtype == torch.float16:
+            np_dtype = np.float16
+        elif self.dtype == torch.bfloat16:
+            # numpy has limited bfloat16 support; fall back to float32 for kernel construction
+            np_dtype = np.float32
+        else:
+            np_dtype = np.float32
+
+        wwc = np.zeros([NORIENT, KERNELSZ * KERNELSZ], dtype=np_dtype)
         wws = np.zeros_like(wwc)
 
         x = np.repeat(np.arange(KERNELSZ) - KERNELSZ // 2, KERNELSZ).reshape(
@@ -802,7 +814,7 @@ class WavelateOperator2Dkernel_torch:
         # Orientation-expanded kernels for the second order (Cin=NORIENT, Cout=NORIENT*NORIENT)
         def doorientw(x: np.ndarray) -> np.ndarray:
             y = np.zeros(
-                [NORIENT * NORIENT, NORIENT, KERNELSZ, KERNELSZ], dtype=self.dtype
+                [NORIENT * NORIENT, NORIENT, KERNELSZ, KERNELSZ], dtype=np_dtype
             )
             for k in range(NORIENT):
                 start = k * NORIENT
