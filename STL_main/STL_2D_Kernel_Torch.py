@@ -702,6 +702,7 @@ class STL_2D_Kernel_Torch:
 
         x_o = _ensure_orient(x)
         y_o = _ensure_orient(y)
+        orient_dim = x_o.dim() - 3  # index of the orientation axis
 
         spatial_dims = (-2, -1)
 
@@ -716,7 +717,11 @@ class STL_2D_Kernel_Torch:
             else:
                 x_c = x_o
                 y_c = y_o
-            prod = x_c.unsqueeze(-3) * y_c.conj().unsqueeze(-4) * mask.unsqueeze(-3)
+            prod = (
+                x_c.unsqueeze(orient_dim)
+                * y_c.conj().unsqueeze(orient_dim + 1)
+                * mask.unsqueeze(orient_dim + 1)
+            )
         else:
             if remove_mean:
                 mx = x_o.mean(dim=spatial_dims, keepdim=True)
@@ -726,7 +731,7 @@ class STL_2D_Kernel_Torch:
             else:
                 x_c = x_o
                 y_c = y_o
-            prod = x_c.unsqueeze(-3) * y_c.conj().unsqueeze(-4)
+            prod = x_c.unsqueeze(orient_dim) * y_c.conj().unsqueeze(orient_dim + 1)
 
         cov = prod.mean(dim=spatial_dims)
 
