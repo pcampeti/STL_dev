@@ -20,6 +20,39 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+def _conv2d_same_symmetric(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """
+    2D convolution with "same" output size and symmetric padding.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor of shape [..., Nx, Ny].
+    w : torch.Tensor
+        Kernel tensor of shape [O_c, wx, wy].
+
+    Returns
+    -------
+    torch.Tensor
+        Convolved tensor with shape [..., O_c, Nx, Ny].
+    """
+
+    *leading_dims, Nx, Ny = x.shape
+    O_c, wx, wy = w.shape
+
+    B = int(torch.prod(torch.tensor(leading_dims))) if leading_dims else 1
+    x4d = x.reshape(B, 1, Nx, Ny)
+
+    weight = w[:, None, :, :]
+    pad_x = wx // 2
+    pad_y = wy // 2
+
+    x_padded = F.pad(x4d, (pad_y, pad_y, pad_x, pad_x), mode="reflect")
+    y = F.conv2d(x_padded, weight)
+
+    return y.reshape(*leading_dims, O_c, Nx, Ny)
+
+
 def _conv2d_circular(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """
     Backend-style 2D convolution mirroring FoCUS/BkTorch strategy.
@@ -51,6 +84,23 @@ def _conv2d_circular(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     y = F.conv2d(x_padded, weight)
 
     return y.reshape(*leading_dims, O_c, Nx, Ny)
+
+
+def _complex_conv2d_same_symmetric(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Complex-aware wrapper around ``_conv2d_same_symmetric``."""
+
+    xr = torch.real(x) if torch.is_complex(x) else x
+    xi = torch.imag(x) if torch.is_complex(x) else torch.zeros_like(xr)
+
+    wr = torch.real(w) if torch.is_complex(w) else w
+    wi = torch.imag(w) if torch.is_complex(w) else torch.zeros_like(wr)
+
+    real_part = _conv2d_same_symmetric(xr, wr) - _conv2d_same_symmetric(xi, wi)
+    imag_part = _conv2d_same_symmetric(xr, wi) + _conv2d_same_symmetric(xi, wr)
+
+    if torch.is_complex(x) or torch.is_complex(w):
+        return torch.complex(real_part, imag_part)
+    return real_part
 
 
 def _complex_conv2d_circular(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -662,46 +712,277 @@ class WavelateOperator2Dkernel_torch:
         self.J = J
         self.device = torch.device(device)
         self.dtype = dtype
-        
-        self.kernel = self._wavelet_kernel(kernel_size,L)
+
+        self.kernel, real_kernel, imag_kernel, smooth_kernel = self._wavelet_kernel(
+            kernel_size, L
+        )
         self.WType='simple'
+        # Precompute real/imag kernels for symmetric padding convolutions
+        self.ww_RealT = [None, real_kernel]
+        self.ww_ImagT = [None, imag_kernel]
+        # Low-pass kernel derived from the explicit FoCUS window
+        self.ww_SmoothT = [None, smooth_kernel]
         
-    def _wavelet_kernel(self,kernel_size: int,n_orientation: int,sigma=1):
-        """Create a 2D Wavelet kernel."""
-        # coords = torch.arange(kernel_size, device=self.device, dtype=self.dtype) - (kernel_size - 1) / 2.0
-        # yy, xx = torch.meshgrid(coords, coords, indexing="ij")
-        # mother_kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))[None,:,:]
-        # angles=torch.arange(n_orientation, device=self.device, dtype=self.dtype)/n_orientation*torch.pi
-        # angles_proj=torch.pi*(xx[None,...]*torch.cos(angles[:,None,None])+yy[None,...]*torch.sin(angles[:,None,None]))
-        # kernel = torch.complex(torch.cos(angles_proj)*mother_kernel,torch.sin(angles_proj)*mother_kernel)
-        # kernel = kernel - torch.mean(kernel,dim=(1,2))[:,None,None]
-        # kernel = kernel / torch.sqrt(torch.sum(kernel**2, dim=(1,2)))[:,None,None]
-        # return kernel.reshape(1,n_orientation,kernel_size,kernel_size)
-        
-        ###Morlay wavelet
-        coords = torch.arange(kernel_size, device=self.device, dtype=self.dtype) - (kernel_size - 1) / 2.0
-        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
-        
-        # Gaussian envelope
-        gaussian_envelope = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
-        
-        # Orientations
-        angles = torch.arange(n_orientation, device=self.device, dtype=self.dtype) / n_orientation * torch.pi
-        
-        # Morlet wavelet: exp(i*k0*x_rot) * gaussian_envelope
-        # x_rot is the coordinate along the orientation direction
-        x_rot = xx[None, :, :] * torch.cos(angles[:, None, None]) + yy[None, :, :] * torch.sin(angles[:, None, None])
-        
-        # Complex Morlet wavelet
-        kernel = torch.exp(1j * 0.75 * np.pi * x_rot ) * gaussian_envelope[None, :, :]
-        
-        # Remove DC component (admissibility condition)
-        kernel = kernel - torch.mean(kernel, dim=(1, 2))[:, None, None]
-        
-        # L2 normalization
-        kernel = kernel / torch.sqrt(torch.sum(torch.abs(kernel)**2, dim=(1, 2)))[:, None, None]
-        
-        return kernel.reshape(1, n_orientation, kernel_size, kernel_size)
+    def _wavelet_kernel(self, kernel_size: int, n_orientation: int):
+        """FoCUS CNNV1 planar wavelet construction (cos/sin over Gaussian)."""
+
+        KERNELSZ = kernel_size
+        NORIENT = n_orientation
+        LAMBDA = 1.0
+
+        # Allocate real/imag components
+        wwc = np.zeros([NORIENT, KERNELSZ * KERNELSZ], dtype=np.float64)
+        wws = np.zeros_like(wwc)
+
+        x = np.repeat(np.arange(KERNELSZ) - KERNELSZ // 2, KERNELSZ).reshape(
+            KERNELSZ, KERNELSZ
+        )
+        y = x.T
+
+        if NORIENT == 1:
+            xx = (3.0 / float(KERNELSZ)) * LAMBDA * x
+            yy = (3.0 / float(KERNELSZ)) * LAMBDA * y
+
+            if KERNELSZ == 5:
+                w_smooth = np.exp(-(xx**2 + yy**2))
+                tmp = np.exp(-2 * (xx**2 + yy**2)) - 0.25 * np.exp(
+                    -0.5 * (xx**2 + yy**2)
+                )
+            else:
+                w_smooth = np.exp(-0.5 * (xx**2 + yy**2))
+                tmp = np.exp(-2 * (xx**2 + yy**2)) - 0.25 * np.exp(
+                    -0.5 * (xx**2 + yy**2)
+                )
+
+            wwc[0] = tmp.flatten() - tmp.mean()
+            wws[0] = np.zeros_like(wwc[0])
+            sigma = np.sqrt((wwc[:, 0] ** 2).mean())
+            wwc[0] /= sigma
+            wws[0] /= sigma
+
+            w_smooth = w_smooth.flatten()
+        else:
+            for i in range(NORIENT):
+                a = (NORIENT - 1 - i) / float(NORIENT) * np.pi
+                if KERNELSZ < 5:
+                    xx = (3.0 / float(KERNELSZ)) * LAMBDA * (
+                        x * np.cos(a) + y * np.sin(a)
+                    )
+                    yy = (3.0 / float(KERNELSZ)) * LAMBDA * (
+                        x * np.sin(a) - y * np.cos(a)
+                    )
+                else:
+                    xx = (3.0 / 5.0) * LAMBDA * (x * np.cos(a) + y * np.sin(a))
+                    yy = (3.0 / 5.0) * LAMBDA * (x * np.sin(a) - y * np.cos(a))
+
+                if KERNELSZ == 5:
+                    w_smooth = np.exp(-2 * ((3.0 / float(KERNELSZ) * xx) ** 2 + (3.0 / float(KERNELSZ) * yy) ** 2))
+                else:
+                    w_smooth = np.exp(-0.5 * (xx**2 + yy**2))
+
+                tmp1 = np.cos(yy * np.pi) * w_smooth
+                tmp2 = np.sin(yy * np.pi) * w_smooth
+
+                wwc[i] = tmp1.flatten() - tmp1.mean()
+                wws[i] = tmp2.flatten() - tmp2.mean()
+                sigma = np.mean(w_smooth)
+                wwc[i] /= sigma
+                wws[i] /= sigma
+
+                w_smooth = w_smooth.flatten()
+
+        w_smooth = w_smooth / w_smooth.sum()
+
+        # Real/imaginary kernels for the primary convolution path
+        real_kernel = torch.tensor(
+            wwc.reshape(NORIENT, KERNELSZ, KERNELSZ), device=self.device, dtype=self.dtype
+        )
+        imag_kernel = torch.tensor(
+            wws.reshape(NORIENT, KERNELSZ, KERNELSZ), device=self.device, dtype=self.dtype
+        )
+
+        # Low-pass smoothing window
+        smooth_kernel = torch.tensor(
+            w_smooth.reshape(1, KERNELSZ, KERNELSZ), device=self.device, dtype=self.dtype
+        )
+
+        # Complex kernel packed for convenience
+        kernel = torch.complex(real_kernel, imag_kernel).unsqueeze(0)
+
+        return kernel, real_kernel, imag_kernel, smooth_kernel
+
+    def _bk_resize_image(self, im: torch.Tensor, noutx: int, nouty: int) -> torch.Tensor:
+        """Torch bilinear resize mirroring FoCUS.backend.bk_resize_image."""
+        *leading, hx, hy = im.shape
+        flat = im.reshape(-1, 1, hx, hy)
+        resized = F.interpolate(flat, size=(noutx, nouty), mode="bilinear", align_corners=False)
+        return resized.reshape(*leading, noutx, nouty)
+
+    def up_grade(self, im: torch.Tensor, nout: int, axis: int = -1, nouty: int = None) -> torch.Tensor:
+        if nouty is None:
+            nouty = nout
+        return self._bk_resize_image(im, nout, nouty)
+
+    def convol(self, in_image: torch.Tensor) -> torch.Tensor:
+        """FoCUS-like convolution with symmetric padding and complex kernels."""
+
+        image = in_image.to(dtype=self.kernel.dtype, device=self.kernel.device)
+        ishape = list(image.shape)
+        if len(ishape) < 2:
+            raise ValueError("Use of 2D scat with data that has less than 2D")
+
+        npix = ishape[-2]
+        npiy = ishape[-1]
+
+        ndata = 1
+        for k in range(len(ishape) - 2):
+            ndata *= ishape[k]
+
+        tim = image.reshape(ndata, npix, npiy)
+
+        if torch.is_complex(tim):
+            rr1 = _conv2d_same_symmetric(torch.real(tim), self.ww_RealT[1])
+            ii1 = _conv2d_same_symmetric(torch.real(tim), self.ww_ImagT[1])
+            rr2 = _conv2d_same_symmetric(torch.imag(tim), self.ww_RealT[1])
+            ii2 = _conv2d_same_symmetric(torch.imag(tim), self.ww_ImagT[1])
+            res = torch.complex(rr1 - ii2, ii1 + rr2)
+        else:
+            rr = _conv2d_same_symmetric(tim, self.ww_RealT[1])
+            ii = _conv2d_same_symmetric(tim, self.ww_ImagT[1])
+            res = torch.complex(rr, ii)
+
+        return res.reshape(ishape[0:-2] + [self.L, npix, npiy])
+
+    def smooth(self, in_image: torch.Tensor) -> torch.Tensor:
+        image = in_image.to(dtype=self.kernel.dtype, device=self.kernel.device)
+        ishape = list(image.shape)
+        if len(ishape) < 2:
+            raise ValueError("Use of 2D scat with data that has less than 2D")
+
+        npix = ishape[-2]
+        npiy = ishape[-1]
+        ndata = 1
+        for k in range(len(ishape) - 2):
+            ndata *= ishape[k]
+
+        tim = image.reshape(ndata, npix, npiy)
+
+        if torch.is_complex(tim):
+            rr = _conv2d_same_symmetric(torch.real(tim), self.ww_SmoothT[1])
+            ii = _conv2d_same_symmetric(torch.imag(tim), self.ww_SmoothT[1])
+            res = torch.complex(rr, ii)
+        else:
+            res = _conv2d_same_symmetric(tim, self.ww_SmoothT[1])
+
+        return res.reshape(ishape)
+
+    def ud_grade_2(self, im: torch.Tensor) -> torch.Tensor:
+        ishape = list(im.shape)
+        if len(ishape) < 2:
+            raise ValueError("Use of 2D scat with data that has less than 2D")
+        npix = ishape[-2]
+        npiy = ishape[-1]
+        if npix % 2 != 0 or npiy % 2 != 0:
+            raise ValueError("Downsampling requires even spatial dimensions")
+
+        ndata = 1
+        for k in range(len(im.shape) - 2):
+            ndata *= ishape[k]
+
+        tim = im.reshape(ndata, npix, npiy, 1).permute(0, 3, 1, 2)
+        res = F.avg_pool2d(tim, kernel_size=2, stride=2)
+        res = res.permute(0, 2, 3, 1)
+        return res.reshape(ishape[0:-2] + [npix // 2, npiy // 2])
+
+    def scattering(self, image1: torch.Tensor):
+        """
+        Compute scattering coefficients (S0, S1, S2, S2L) following FoCUS CNNV1
+        planar backend. Masking and normalization are intentionally omitted.
+        """
+
+        if image1.dim() == 2:
+            I1 = image1.unsqueeze(0)
+        else:
+            I1 = image1
+
+        im_shape = I1.shape
+        nside = min(im_shape[-2], im_shape[-1])
+        jmax = int(math.log(nside - self.KERNELSZ) / math.log(2))
+
+        if self.KERNELSZ > 3:
+            if self.KERNELSZ == 5:
+                l_image1 = self.up_grade(I1, I1.shape[-2] * 2, nouty=I1.shape[-1] * 2)
+            else:
+                l_image1 = self.up_grade(I1, I1.shape[-2] * 4, nouty=I1.shape[-1] * 4)
+        else:
+            l_image1 = I1
+
+        s0 = l_image1.mean(dim=(-2, -1), keepdim=False)
+        p00 = None
+        s1 = None
+        s2 = None
+        s2l = None
+        l2_image = None
+        s2j1 = []
+        s2j2 = []
+
+        for j1 in range(jmax):
+            c_image1 = self.convol(l_image1)
+
+            conj = c_image1 * torch.conj(c_image1)
+            l_p00 = conj.mean(dim=(-2, -1)).unsqueeze(-2)
+            conj_mod = torch.abs(conj)
+            l_s1 = conj_mod.mean(dim=(-2, -1)).unsqueeze(-2)
+
+            if s1 is None:
+                s1 = l_s1
+                p00 = l_p00
+            else:
+                s1 = torch.cat([s1, l_s1], dim=-2)
+                p00 = torch.cat([p00, l_p00], dim=-2)
+
+            if l2_image is None:
+                l2_image = conj_mod.unsqueeze(-4)
+            else:
+                l2_image = torch.cat([conj_mod.unsqueeze(-4), l2_image], dim=-4)
+
+            c2_image = self.convol(F.relu(l2_image))
+            conj2p = c2_image * torch.conj(c2_image)
+            conj2pl1 = torch.abs(conj2p)
+
+            c2_image_m = self.convol(F.relu(-l2_image))
+            conj2m = c2_image_m * torch.conj(c2_image_m)
+            conj2ml1 = torch.abs(conj2m)
+
+            l_s2 = (conj2p - conj2m).mean(dim=(-2, -1))
+            l_s2l1 = (conj2pl1 - conj2ml1).mean(dim=(-2, -1))
+
+            if s2 is None:
+                s2l = l_s2
+                s2 = l_s2l1
+                s2j1 = list(range(l_s2.shape[-3]))
+                s2j2 = [j1] * l_s2.shape[-3]
+            else:
+                s2 = torch.cat([s2, l_s2l1], dim=-3)
+                s2l = torch.cat([s2l, l_s2], dim=-3)
+                s2j1.extend(list(range(l_s2.shape[-3])))
+                s2j2.extend([j1] * l_s2.shape[-3])
+
+            if j1 != jmax - 1:
+                l2_image = self.smooth(l2_image)
+                l2_image = self.ud_grade_2(l2_image)
+                l_image1 = self.smooth(l_image1)
+                l_image1 = self.ud_grade_2(l_image1)
+
+        return {
+            "s0": s0,
+            "p00": p00,
+            "s1": s1,
+            "s2": s2,
+            "s2l": s2l,
+            "s2j1": torch.as_tensor(s2j1, device=s0.device),
+            "s2j2": torch.as_tensor(s2j2, device=s0.device),
+        }
             
     def get_L(self):
         return self.L
@@ -732,7 +1013,7 @@ class WavelateOperator2Dkernel_torch:
 
         weight = self.kernel.squeeze(0)  # [L, K, K]
 
-        convolved = _complex_conv2d_circular(x, weight)
+        convolved = _complex_conv2d_same_symmetric(x, weight)
 
         return STL_2D_Kernel_Torch(convolved,smooth_kernel=data.smooth_kernel,dg=data.dg,N0=data.N0)
         
